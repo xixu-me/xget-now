@@ -1,0 +1,206 @@
+name: Dependabot Auto Merge
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+jobs:
+  merge:
+    name: Auto-merge Dependabot PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Merge Dependabot PRs when checks pass
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            const successfulCheckConclusions = new Set(["success", "skipped", "neutral"]);
+            const successfulStatusStates = new Set(["success"]);
+            const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+            const latestBy = (items, keyOf, timeOf) => {
+              const latest = new Map();
+              for (const item of items) {
+                const key = keyOf(item);
+                const itemTime = new Date(timeOf(item) || 0).getTime();
+                const existing = latest.get(key);
+                const existingTime = existing ? new Date(timeOf(existing) || 0).getTime() : -1;
+                if (!existing || itemTime >= existingTime) {
+                  latest.set(key, item);
+                }
+              }
+              return [...latest.values()];
+            };
+
+            const findCandidatePulls = async () => {
+              if (context.eventName === "pull_request_target") {
+                const pr = context.payload.pull_request;
+                return pr?.user?.login === "dependabot[bot]" && pr?.state === "open" ? [pr] : [];
+              }
+
+              const pulls = await github.paginate(github.rest.pulls.list, {
+                owner,
+                repo,
+                state: "open",
+                per_page: 100,
+              });
+
+              return pulls.filter((pr) => pr.user?.login === "dependabot[bot]");
+            };
+
+            const getMergeablePullRequest = async (pull_number) => {
+              for (let attempt = 1; attempt <= 6; attempt += 1) {
+                const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+                if (pr.mergeable !== null) {
+                  return pr;
+                }
+                core.info("PR #" + pull_number + " mergeability is still being computed; retry " + attempt + "/6.");
+                await wait(5000);
+              }
+
+              const { data: pr } = await github.rest.pulls.get({ owner, repo, pull_number });
+              return pr;
+            };
+
+            const getSignalState = async (sha) => {
+              const checkRuns = await github.paginate(github.rest.checks.listForRef, {
+                owner,
+                repo,
+                ref: sha,
+                per_page: 100,
+              });
+
+              const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, {
+                owner,
+                repo,
+                ref: sha,
+                per_page: 100,
+              });
+
+              const latestChecks = latestBy(
+                checkRuns.filter((run) => run.name !== "Dependabot Auto Merge"),
+                (run) => (run.app?.slug || "unknown") + ":" + run.name,
+                (run) => run.completed_at || run.started_at || run.created_at,
+              );
+              const latestStatuses = latestBy(statuses, (status) => status.context, (status) => status.updated_at || status.created_at);
+
+              const pendingChecks = latestChecks.filter((run) => run.status !== "completed");
+              const failedChecks = latestChecks.filter(
+                (run) => run.status === "completed" && !successfulCheckConclusions.has(String(run.conclusion || "").toLowerCase()),
+              );
+              const failedStatuses = latestStatuses.filter((status) => !successfulStatusStates.has(String(status.state || "").toLowerCase()));
+
+              return {
+                totalSignals: latestChecks.length + latestStatuses.length,
+                pendingChecks,
+                failedChecks,
+                failedStatuses,
+              };
+            };
+
+            const { data: repository } = await github.rest.repos.get({ owner, repo });
+            const mergeMethods = [];
+            if (repository.allow_merge_commit) mergeMethods.push("merge");
+            if (repository.allow_squash_merge) mergeMethods.push("squash");
+            if (repository.allow_rebase_merge) mergeMethods.push("rebase");
+
+            if (mergeMethods.length === 0) {
+              core.info("This repository has no enabled pull request merge methods.");
+              return;
+            }
+
+            const pulls = await findCandidatePulls();
+            if (pulls.length === 0) {
+              core.info("No open Dependabot PRs to evaluate.");
+              return;
+            }
+
+            for (const candidate of pulls) {
+              const pull_number = candidate.number;
+              const pr = await getMergeablePullRequest(pull_number);
+
+              if (pr.user?.login !== "dependabot[bot]") {
+                core.info("PR #" + pull_number + " is no longer a Dependabot PR.");
+                continue;
+              }
+
+              if (pr.state !== "open" || pr.draft) {
+                core.info("PR #" + pull_number + " is not an open, ready PR.");
+                continue;
+              }
+
+              if (pr.mergeable !== true) {
+                core.info("PR #" + pull_number + " is not currently mergeable.");
+                continue;
+              }
+
+              const signalState = await getSignalState(pr.head.sha);
+              if (signalState.totalSignals === 0) {
+                core.info("PR #" + pull_number + " has no checks or statuses yet; skipping.");
+                continue;
+              }
+
+              if (signalState.pendingChecks.length > 0) {
+                core.info("PR #" + pull_number + " still has pending checks: " + signalState.pendingChecks.map((run) => run.name).join(", ") + ".");
+                continue;
+              }
+
+              if (signalState.failedChecks.length > 0 || signalState.failedStatuses.length > 0) {
+                const failedChecks = signalState.failedChecks.map((run) => run.name + "=" + run.conclusion).join(", ");
+                const failedStatuses = signalState.failedStatuses.map((status) => status.context + "=" + status.state).join(", ");
+                core.info("PR #" + pull_number + " is not green. Checks: " + (failedChecks || "none") + ". Statuses: " + (failedStatuses || "none") + ".");
+                continue;
+              }
+
+              let merged = false;
+              let lastError = null;
+              for (const merge_method of mergeMethods) {
+                try {
+                  await github.rest.pulls.merge({ owner, repo, pull_number, merge_method });
+                  core.info("Merged Dependabot PR #" + pull_number + " with " + merge_method + ".");
+                  merged = true;
+                  break;
+                } catch (error) {
+                  lastError = error;
+                  if (error.status === 405 || error.status === 409) {
+                    core.info("Cannot merge PR #" + pull_number + " with " + merge_method + ": " + error.message);
+                    continue;
+                  }
+                  throw error;
+                }
+              }
+
+              if (!merged) {
+                core.info("PR #" + pull_number + " could not be merged: " + (lastError?.message || "unknown error") + ".");
+                continue;
+              }
+
+              if (pr.head.repo?.full_name === owner + "/" + repo) {
+                try {
+                  await github.rest.git.deleteRef({ owner, repo, ref: "heads/" + pr.head.ref });
+                  core.info("Deleted branch " + pr.head.ref + ".");
+                } catch (error) {
+                  core.info("Could not delete branch " + pr.head.ref + ": " + error.message);
+                }
+              }
+            }
