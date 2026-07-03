@@ -1,18 +1,19 @@
 name: Dependabot Auto Merge
 
 on:
-  pull_request_target:
+  workflow_run:
+    workflows:
+      - "CodeQL"
+      - "Dependabot Updates"
+      - "发布扩展到多个应用商店"
+      - "测试构建"
+      - "自动合并 Dependabot 更新"
     types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
-  schedule:
-    - cron: "*/30 * * * *"
+      - completed
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -53,9 +54,17 @@ jobs:
             };
 
             const findCandidatePulls = async () => {
-              if (context.eventName === "pull_request_target") {
-                const pr = context.payload.pull_request;
-                return pr?.user?.login === "dependabot[bot]" && pr?.state === "open" ? [pr] : [];
+              const branch = context.payload.workflow_run?.head_branch;
+              if (context.eventName === "workflow_run" && branch) {
+                const { data: pulls } = await github.rest.pulls.list({
+                  owner,
+                  repo,
+                  state: "open",
+                  head: owner + ":" + branch,
+                  per_page: 10,
+                });
+
+                return pulls.filter((pr) => pr.user?.login === "dependabot[bot]");
               }
 
               const pulls = await github.paginate(github.rest.pulls.list, {
